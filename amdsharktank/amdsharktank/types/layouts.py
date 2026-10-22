@@ -48,6 +48,7 @@ __all__ = [
     "BlockScaledI4Layout",
     "BlockScaledLayout",
     "BlockScaledPackedLayout",
+    "BlockScaledQ5_0Layout",        
     "SuperBlockOffsetScaled_4_6_Layout",
     "TensorScaledLayout",
 ]
@@ -403,7 +404,105 @@ class BlockScaledI4Layout(BlockScaledPackedLayout):
         """Unpack the underlying bit-packed tensor into logical values."""
         return promote_linear_i4_block_to_i8(qs, signed=self.signed)
 
+@register_quantized_layout
+class BlockScaledQ5_0Layout(QuantizedLayout):
+    """Planar form of the GGML Q5_0 format (5-bit, one f16 scale per block of 32).
 
+    The GGML block is 22 bytes:
+
+        typedef struct {
+            ggml_half d;           // delta
+            uint8_t qh[4];         // 5-th bit of quants
+            uint8_t qs[QK5_0 / 2]; // nibbles / quants
+        } block_q5_0;
+
+    Planes (GGML bit packing is kept untouched, nothing is dequantized):
+    * `d`:  `[..., K // 32, 1]`  f16 scale per block.
+    * `qh`: `[..., K // 32, 4]`  uint8. One little-endian uint32 per block;
+      bit `j` is the 5-th bit of element `j` (byte `j // 8`, bit `j % 8`).
+    * `qs`: `[..., K // 32, 16]` uint8. Byte `j` holds the low 4 bits of element
+      `j` in its low nibble and of element `j + 16` in its high nibble.
+
+    Dequantization (in f32): `w = d * (q - 16)`, `q = low4 | (bit << 4)`, 0..31.
+    """
+
+    BLOCK_SIZE = 32
+
+    def __init__(self, shape: list[int], d: torch.Tensor, qh: torch.Tensor, qs: torch.Tensor):
+        self._shape = shape
+        self._d = d
+        self._qh = qh
+        self._qs = qs
+
+    @classmethod
+    def serialized_name(cls) -> str:
+        return "BlockScaledQ5_0Layout"
+
+    @classmethod
+    def create(
+        cls,
+        shape: list[int],
+        metadata: Optional[dict[str, MetaDataValueType]],
+        planes: dict[str, torch.Tensor],
+    ):
+        return cls(shape, d=planes["d"], qh=planes["qh"], qs=planes["qs"])
+
+    @property
+    def planes(self) -> dict[str, torch.Tensor]:
+        return {
+            "d": self._d,
+            "qh": self._qh,
+            "qs": self._qs,
+        }
+
+    @property
+    def shape(self) -> list[int]:
+        return self._shape
+
+    @property
+    def d(self) -> torch.Tensor:
+        return self._d
+
+    @property
+    def qh(self) -> torch.Tensor:
+        return self._qh
+
+    @property
+    def qs(self) -> torch.Tensor:
+        return self._qs
+
+    def unpack_q(self) -> torch.Tensor:
+        """Logical 5-bit values (0..31) as int32 `[..., K // 32, 32]`."""
+        qs = self._qs
+        qh = self._qh
+        if qs.dtype == torch.int8:
+            qs = qs.view(torch.uint8)
+        if qh.dtype == torch.int8:
+            qh = qh.view(torch.uint8)
+        qs = qs.to(torch.int32)
+        qh = qh.to(torch.int32)
+        # Elements 0..15 are the low nibbles, 16..31 the high nibbles.
+        low4 = torch.cat([qs & 0xF, (qs >> 4) & 0xF], dim=-1)
+        # Bit j of the little endian uint32 == byte (j // 8), bit (j % 8).
+        shifts = torch.arange(8, dtype=torch.int32)
+        high_bit = ((qh.unsqueeze(-1) >> shifts) & 1).flatten(-2)
+        return low4 | (high_bit << 4)
+
+    def dequant(self, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+        return self.dequant_blocked(dtype).reshape(self.shape)
+
+    def dequant_blocked(self, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+        q = self.unpack_q()
+        # Always compute in f32, then cast. This matches llama.cpp exactly.
+        w = self._d.to(torch.float32) * (q - 16).to(torch.float32)
+        return w.to(dtype if dtype is not None else self._d.dtype)
+
+    def __repr__(self):
+        return (
+            f"{type(self).__name__}(d({list(self.d.shape)}, dtype={self.d.dtype}), "
+            f"qh({list(self.qh.shape)}, dtype={self.qh.dtype}), "
+            f"qs({list(self.qs.shape)}, dtype={self.qs.dtype}))"
+        )
 @register_quantized_layout
 class SuperBlockOffsetScaled_4_6_Layout(QuantizedLayout):
     """Effectively a planarized version of the ggml Q4_K layout."""

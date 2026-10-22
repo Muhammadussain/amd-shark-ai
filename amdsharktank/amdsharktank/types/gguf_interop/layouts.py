@@ -14,6 +14,7 @@ from ..tensors import (
 from ..layouts import (
     BlockScaledLayout,
     BlockScaledI4Layout,
+    BlockScaledQ5_0Layout,
     SuperBlockOffsetScaled_4_6_Layout,
 )
 
@@ -24,9 +25,47 @@ from ..layout_utils import (
 __all__ = [
     "Q4_1",
     "Q4_K",
+    "Q5_0",
     "Q8_0",
 ]
+class Q5_0(QuantizedTensor[BlockScaledQ5_0Layout]):
+    """Support quantized tensors in the Q5_0 format.
 
+        #define QK5_0 32
+        typedef struct {
+            ggml_half d;           // delta
+            uint8_t qh[4];         // 5-th bit of quants
+            uint8_t qs[QK5_0 / 2]; // nibbles / quants
+        } block_q5_0;
+
+    A block is 22 bytes. `unpack()` only splits the bytes into the planes
+    `d`, `qh`, `qs`; nothing is dequantized and no bits are rearranged.
+    """
+
+    BLOCK_BYTES = 22
+
+    def __init__(self, *, raw: torch.Tensor, shape: list[int], name: str = UnnamedTensorName):
+        super().__init__(name=name, shape=shape, layout_type=BlockScaledQ5_0Layout)
+        assert raw.dtype == torch.uint8
+        self.raw = raw  
+
+    def unpack(self) -> BlockScaledQ5_0Layout:
+        # A 22 byte block is not a multiple of 4 bytes, so work in bytes and
+        # view the f16 scale from a freshly materialized 2 byte slice.
+        linear_blocks = self.raw.reshape(-1, self.BLOCK_BYTES)
+        block_shape = self.shape[0:-1] + [-1, self.BLOCK_BYTES]
+        blocks = linear_blocks.reshape(block_shape)
+        d = blocks[..., 0:2].contiguous().view(torch.float16)
+        qh = blocks[..., 2:6].contiguous()
+        qs = blocks[..., 6:].contiguous()
+        return BlockScaledQ5_0Layout(self.shape, d=d, qh=qh, qs=qs)
+
+    @property
+    def subtensors(self):
+        return {self.name: self.raw}
+
+    def __repr__(self):
+        return f"Q5_0({self.name}, {self.shape})"
 
 class Q8_0(QuantizedTensor[BlockScaledLayout]):
     """
